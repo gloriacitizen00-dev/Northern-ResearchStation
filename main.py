@@ -1,6 +1,31 @@
+
 import requests
 import csv
 import os
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+
+
+# ==========================================
+# NORTHERNLIGHT RESEARCH STATION
+# ==========================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+CSV_FILE = BASE_DIR / "kp_history.csv"
+DATA_DIR = BASE_DIR / "data"
+JSON_FILE = DATA_DIR / "northernlight.json"
+
+NOAA_URL = (
+    "https://services.swpc.noaa.gov/"
+    "products/noaa-planetary-k-index.json"
+)
+
+
+# ==========================================
+# GEOMAGNETIC CLASSIFICATION
+# ==========================================
 
 def classify_kp(kp):
 
@@ -22,102 +47,222 @@ def classify_kp(kp):
     else:
         return "No geomagnetic storm"
 
-print(classify_kp(6.0))
-print(classify_kp(8.0))
-print(classify_kp(3.0)) 
 
-url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+# ==========================================
+# FETCH NOAA DATA
+# ==========================================
 
-response = requests.get(url, timeout=20)
-response.raise_for_status()
+def fetch_noaa_data():
 
-data = response.json()
+    print("\nConnecting to NOAA...")
 
-# Excluir los encabezados y extraer los valores Kp
-measurements = data
+    response = requests.get(NOAA_URL, timeout=20)
+    response.raise_for_status()
 
-kp_values = []
-history = []
+    data = response.json()
 
-for measurement in measurements:
-    kp = float(measurement["Kp"])
-    date = measurement["time_tag"]
+    if not data:
+        raise ValueError("NOAA returned an empty response.")
 
-    kp_values.append(kp)
+    history = []
 
-    classification = classify_kp(kp)
+    for measurement in data:
 
-    history.append({
-        "date": date,
-        "kp": kp,
-        "classification": classification,
-        "source": "NOAA"
-    })
+        if not isinstance(measurement, dict):
+            continue
 
-    print(
-        "Date:", date,
-        "| Kp:", kp,
-        "| Classification:", classification
-    )
+        if "Kp" not in measurement or "time_tag" not in measurement:
+            continue
 
-# Calcular indicadores
-kp_max = max(kp_values)
-kp_min = min(kp_values)
-kp_average = sum(kp_values) / len(kp_values)
+        if measurement["Kp"] in (None, ""):
+            continue
 
-# Mostrar resultados
-print("NORTHERN LIGHT RESEARCH STATION")
-print("--------------------------------")
+        kp = float(measurement["Kp"])
+        date = measurement["time_tag"]
 
-print("Measurements analyzed:", len(kp_values))
+        history.append({
+            "date": date,
+            "kp": kp,
+            "classification": classify_kp(kp),
+            "source": "NOAA"
+        })
 
-print("\nGEOMAGNETIC ACTIVITY ANALYSIS")
-print("--------------------------------")
+    if not history:
+        raise ValueError("No valid Kp measurements were received.")
 
-print("Maximum Kp:", kp_max)
-print("Minimum Kp:", kp_min)
-print("Average Kp:", round(kp_average, 2))
-# Save historical measurements to CSV
+    return history
 
-csv_file = "kp_history.csv"
 
-# Check existing historical records
-existing_dates = set()
+# ==========================================
+# SAVE HISTORICAL CSV
+# ==========================================
 
-if os.path.exists(csv_file):
+def save_csv(history):
 
-    with open(csv_file, "r", newline="", encoding="utf-8") as file:
+    existing_dates = set()
+
+    if CSV_FILE.exists():
+
+        with open(
+            CSV_FILE, "r", newline="", encoding="utf-8"
+        ) as file:
+
+            reader = csv.DictReader(file)
+
+            for row in reader:
+                existing_dates.add(row["date"])
+
+    new_records = []
+
+    for record in history:
+
+        if record["date"] not in existing_dates:
+
+            new_records.append(record)
+            existing_dates.add(record["date"])
+
+    fieldnames = [
+        "date",
+        "kp",
+        "classification",
+        "source"
+    ]
+
+    with open(
+        CSV_FILE, "a", newline="", encoding="utf-8"
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames
+        )
+
+        if file.tell() == 0:
+            writer.writeheader()
+
+        writer.writerows(new_records)
+
+    print("\nCSV historical data saved.")
+    print("New measurements:", len(new_records))
+    print("Historical records:", len(existing_dates))
+
+
+# ==========================================
+# READ COMPLETE HISTORY
+# ==========================================
+
+def load_historical_data():
+
+    measurements = []
+
+    if not CSV_FILE.exists():
+        return measurements
+
+    with open(
+        CSV_FILE, "r", newline="", encoding="utf-8"
+    ) as file:
 
         reader = csv.DictReader(file)
 
         for row in reader:
-            existing_dates.add(row["date"])
+
+            measurements.append({
+                "date": row["date"],
+                "kp": float(row["kp"]),
+                "classification": row["classification"],
+                "source": row["source"]
+            })
+
+    return measurements
 
 
-# Identify new measurements
-new_records = []
+# ==========================================
+# EXPORT JSON
+# ==========================================
 
-for record in history:
+def export_json(history):
 
-    if record["date"] not in existing_dates:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-        new_records.append(record)
-        existing_dates.add(record["date"])
+    kp_values = [record["kp"] for record in history]
+
+    statistics = {
+        "maximum_kp": max(kp_values),
+        "minimum_kp": min(kp_values),
+        "average_kp": round(
+            sum(kp_values) / len(kp_values), 2
+        ),
+        "measurements_analyzed": len(kp_values)
+    }
+
+    output = {
+        "station": "Northernlight Research Station",
+        "source": "NOAA SWPC",
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "statistics": statistics,
+        "measurements": history
+    }
+
+    with open(
+        JSON_FILE, "w", encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            output,
+            file,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print("\nJSON export completed.")
+    print("File:", JSON_FILE)
+    print("Exported measurements:", len(history))
 
 
-# Append new measurements without deleting previous records
-with open(csv_file, "a", newline="", encoding="utf-8") as file:
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 
-    fieldnames = ["date", "kp", "classification", "source"]
+def main():
 
-    writer = csv.DictWriter(file, fieldnames=fieldnames)
+    print("\nNORTHERNLIGHT RESEARCH STATION")
+    print("--------------------------------")
 
-    if file.tell() == 0:
-        writer.writeheader()
+    # Obtain current NOAA measurements
+    new_history = fetch_noaa_data()
 
-    writer.writerows(new_records)
+    # Save historical records
+    save_csv(new_history)
+
+    # Load complete historical database
+    complete_history = load_historical_data()
+
+    # Calculate current NOAA statistics
+    kp_values = [record["kp"] for record in new_history]
+
+    print("\nGEOMAGNETIC ACTIVITY ANALYSIS")
+    print("--------------------------------")
+
+    print("Maximum Kp:", max(kp_values))
+    print("Minimum Kp:", min(kp_values))
+
+    print(
+        "Average Kp:",
+        round(sum(kp_values) / len(kp_values), 2)
+    )
+
+    print(
+        "Historical measurements:",
+        len(complete_history)
+    )
+
+    # Export complete history to JSON
+    export_json(complete_history)
+
+    print("\nNorthernlight execution completed.")
 
 
-print("\nHistorical data saved to", csv_file)
-print("New measurements added:", len(new_records))
-print("Total historical records:", len(existing_dates))
+if __name__ == "__main__":
+    main()
