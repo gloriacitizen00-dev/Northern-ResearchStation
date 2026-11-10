@@ -3,6 +3,7 @@ import requests
 import csv
 import os
 import json
+
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -22,6 +23,15 @@ NOAA_URL = (
     "products/noaa-planetary-k-index.json"
 )
 
+FIELDNAMES = [
+    "date",
+    "kp",
+    "classification",
+    "a_running",
+    "station_count",
+    "source"
+]
+
 
 # ==========================================
 # GEOMAGNETIC CLASSIFICATION
@@ -31,21 +41,31 @@ def classify_kp(kp):
 
     if kp >= 9:
         return "G5 - Extreme"
-
     elif kp >= 8:
         return "G4 - Severe"
-
     elif kp >= 7:
         return "G3 - Strong"
-
     elif kp >= 6:
         return "G2 - Moderate"
-
     elif kp >= 5:
         return "G1 - Minor"
 
-    else:
-        return "No geomagnetic storm"
+    return "No geomagnetic storm"
+
+
+# ==========================================
+# OPTIONAL NOAA VALUES
+# ==========================================
+
+def optional_number(value):
+
+    if value in (None, ""):
+        return None
+
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return None
 
 
 # ==========================================
@@ -54,15 +74,19 @@ def classify_kp(kp):
 
 def fetch_noaa_data():
 
-    print("\nConnecting to NOAA...")
+    print("\nConnecting to NOAA SWPC...")
 
-    response = requests.get(NOAA_URL, timeout=20)
+    response = requests.get(
+        NOAA_URL,
+        timeout=20
+    )
+
     response.raise_for_status()
 
     data = response.json()
 
-    if not data:
-        raise ValueError("NOAA returned an empty response.")
+    if not isinstance(data, list) or not data:
+        raise ValueError("Invalid NOAA response.")
 
     history = []
 
@@ -71,142 +95,231 @@ def fetch_noaa_data():
         if not isinstance(measurement, dict):
             continue
 
-        if "Kp" not in measurement or "time_tag" not in measurement:
+        date = measurement.get("time_tag")
+        kp_value = measurement.get("Kp")
+
+        if not date or kp_value in (None, ""):
             continue
 
-        if measurement["Kp"] in (None, ""):
+        try:
+            kp = float(kp_value)
+        except (ValueError, TypeError):
             continue
 
-        kp = float(measurement["Kp"])
-        date = measurement["time_tag"]
+        if not 0 <= kp <= 9:
+            continue
 
         history.append({
             "date": date,
             "kp": kp,
             "classification": classify_kp(kp),
+            "a_running": optional_number(
+                measurement.get("a_running")
+            ),
+            "station_count": optional_number(
+                measurement.get("station_count")
+            ),
             "source": "NOAA"
         })
 
     if not history:
-        raise ValueError("No valid Kp measurements were received.")
+        raise ValueError("No valid NOAA measurements.")
 
     return history
 
 
 # ==========================================
-# SAVE HISTORICAL CSV
+# READ EXISTING CSV
 # ==========================================
 
-def save_csv(history):
+def read_csv_history():
 
-    existing_dates = set()
-
-    if CSV_FILE.exists():
-
-        with open(
-            CSV_FILE, "r", newline="", encoding="utf-8"
-        ) as file:
-
-            reader = csv.DictReader(file)
-
-            for row in reader:
-                existing_dates.add(row["date"])
-
-    new_records = []
-
-    for record in history:
-
-        if record["date"] not in existing_dates:
-
-            new_records.append(record)
-            existing_dates.add(record["date"])
-
-    fieldnames = [
-        "date",
-        "kp",
-        "classification",
-        "source"
-    ]
-
-    with open(
-        CSV_FILE, "a", newline="", encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames
-        )
-
-        if file.tell() == 0:
-            writer.writeheader()
-
-        writer.writerows(new_records)
-
-    print("\nCSV historical data saved.")
-    print("New measurements:", len(new_records))
-    print("Historical records:", len(existing_dates))
-
-
-# ==========================================
-# READ COMPLETE HISTORY
-# ==========================================
-
-def load_historical_data():
-
-    measurements = []
+    records = {}
 
     if not CSV_FILE.exists():
-        return measurements
+        return records
 
     with open(
-        CSV_FILE, "r", newline="", encoding="utf-8"
+        CSV_FILE,
+        "r",
+        newline="",
+        encoding="utf-8"
     ) as file:
 
         reader = csv.DictReader(file)
 
         for row in reader:
 
-            measurements.append({
-                "date": row["date"],
-                "kp": float(row["kp"]),
-                "classification": row["classification"],
-                "source": row["source"]
-            })
+            date = row.get("date")
 
-    return measurements
+            if not date:
+                continue
+
+            try:
+                kp = float(row["kp"])
+            except (ValueError, TypeError, KeyError):
+                continue
+
+            records[date] = {
+                "date": date,
+                "kp": kp,
+                "classification": (
+                    row.get("classification")
+                    or classify_kp(kp)
+                ),
+                "a_running": optional_number(
+                    row.get("a_running")
+                ),
+                "station_count": optional_number(
+                    row.get("station_count")
+                ),
+                "source": row.get("source") or "NOAA"
+            }
+
+    return records
+
+
+# ==========================================
+# UPDATE HISTORICAL CSV
+# ==========================================
+
+def save_csv(history):
+
+    records = read_csv_history()
+
+    new_records = 0
+    updated_records = 0
+
+    for measurement in history:
+
+        date = measurement["date"]
+
+        if date in records:
+
+            previous = records[date].copy()
+
+            updated = previous.copy()
+            updated.update(measurement)
+
+            # Preserve existing optional values
+            # if NOAA does not provide them.
+
+            for field in ("a_running", "station_count"):
+
+                if measurement[field] is None:
+                    updated[field] = previous[field]
+
+            if updated != previous:
+                updated_records += 1
+
+            records[date] = updated
+
+        else:
+
+            records[date] = measurement
+            new_records += 1
+
+    ordered_records = sorted(
+        records.values(),
+        key=lambda item: item["date"]
+    )
+
+    temporary_file = CSV_FILE.with_suffix(".tmp")
+
+    with open(
+        temporary_file,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=FIELDNAMES
+        )
+
+        writer.writeheader()
+        writer.writerows(ordered_records)
+
+    os.replace(temporary_file, CSV_FILE)
+
+    print("\nCSV historical database updated.")
+    print("New measurements:", new_records)
+    print("Updated measurements:", updated_records)
+    print("Total historical records:", len(records))
+
+    return ordered_records
+
+
+# ==========================================
+# CALCULATE STATISTICS
+# ==========================================
+
+def calculate_statistics(history):
+
+    if not history:
+        raise ValueError("No measurements available.")
+
+    values = [
+        record["kp"]
+        for record in history
+    ]
+
+    return {
+        "maximum_kp": max(values),
+        "minimum_kp": min(values),
+        "average_kp": round(
+            sum(values) / len(values), 2
+        ),
+        "measurements_analyzed": len(values)
+    }
 
 
 # ==========================================
 # EXPORT JSON
 # ==========================================
 
-def export_json(history):
+def export_json(history, latest_history):
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    kp_values = [record["kp"] for record in history]
+    ordered_latest = sorted(
+        latest_history,
+        key=lambda item: item["date"]
+    )
 
-    statistics = {
-        "maximum_kp": max(kp_values),
-        "minimum_kp": min(kp_values),
-        "average_kp": round(
-            sum(kp_values) / len(kp_values), 2
-        ),
-        "measurements_analyzed": len(kp_values)
-    }
+    latest_measurement = ordered_latest[-1]
 
     output = {
         "station": "Northernlight Research Station",
+
         "source": "NOAA SWPC",
+
         "updated_at": datetime.now(
             timezone.utc
         ).isoformat(),
-        "statistics": statistics,
+
+        "statistics": calculate_statistics(history),
+
+        "latest_noaa": {
+            "statistics": calculate_statistics(
+                latest_history
+            ),
+            "latest_measurement": latest_measurement
+        },
+
         "measurements": history
     }
 
+    temporary_file = JSON_FILE.with_suffix(".tmp")
+
     with open(
-        JSON_FILE, "w", encoding="utf-8"
+        temporary_file,
+        "w",
+        encoding="utf-8"
     ) as file:
 
         json.dump(
@@ -215,6 +328,8 @@ def export_json(history):
             indent=4,
             ensure_ascii=False
         )
+
+    os.replace(temporary_file, JSON_FILE)
 
     print("\nJSON export completed.")
     print("File:", JSON_FILE)
@@ -228,38 +343,34 @@ def export_json(history):
 def main():
 
     print("\nNORTHERNLIGHT RESEARCH STATION")
-    print("--------------------------------")
+    print("=" * 45)
 
-    # Obtain current NOAA measurements
+    # 1. Obtain NOAA measurements
+
     new_history = fetch_noaa_data()
 
-    # Save historical records
-    save_csv(new_history)
+    # 2. Update historical database
 
-    # Load complete historical database
-    complete_history = load_historical_data()
+    complete_history = save_csv(new_history)
 
-    # Calculate current NOAA statistics
-    kp_values = [record["kp"] for record in new_history]
+    # 3. Calculate current statistics
 
-    print("\nGEOMAGNETIC ACTIVITY ANALYSIS")
-    print("--------------------------------")
-
-    print("Maximum Kp:", max(kp_values))
-    print("Minimum Kp:", min(kp_values))
-
-    print(
-        "Average Kp:",
-        round(sum(kp_values) / len(kp_values), 2)
+    current_statistics = calculate_statistics(
+        new_history
     )
 
-    print(
-        "Historical measurements:",
-        len(complete_history)
-    )
+    print("\nCURRENT NOAA ANALYSIS")
+    print("-" * 35)
 
-    # Export complete history to JSON
-    export_json(complete_history)
+    for key, value in current_statistics.items():
+        print(f"{key}: {value}")
+
+    # 4. Export complete JSON database
+
+    export_json(
+        complete_history,
+        new_history
+    )
 
     print("\nNorthernlight execution completed.")
 
